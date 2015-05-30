@@ -1,15 +1,36 @@
 tester-contact-point: localhost
 recorder-contact-point: localhost
 jmx-port: 7199
-test-name: test2
+recording-keyspace: test2
 frequency: 100
+
+test-invocation: /home/tjb1982/nclk/them/datastax/apache-cassandra-2.0.15/tools/bin/cassandra-stress
 
 attributes:
   - object-name: org.apache.cassandra.metrics:type=ColumnFamily,name=LiveSSTableCount
     attribute: Value
+    assertions:
+      - directional:
+        - asc
+      - non-negative:
+        - true
+      - volatile:
+        - 10
   - object-name: org.apache.cassandra.metrics:type=ColumnFamily,name=AllMemtablesDataSize
     attribute: Value
+    assertions:
+      - non-negative:
+        - true
+      - directional:
+        - asc
+      - volatile:
+        - 10
   - object-name: org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency
     attribute: 95thPercentile
     frequency: 1
+    assertions:
+      - non-negative:
+        - true
+      - volatile:
+        - 30
 
