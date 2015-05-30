@@ -64,7 +64,7 @@
       (Thread/sleep (or (:frequency attribute) frequency))
       (if (nil? @finished)
         (recur session test-keyspace iteration jmx-host jmx-port attribute frequency finished (inc idx))
-        {:attribute attribute :iterations idx}))))
+        {:attribute attribute :queries idx}))))
 
 (defn maybe-create-test-schema
   [session test-keyspace]
@@ -72,6 +72,11 @@
                           "create keyspace if not exists " test-keyspace
                           " with replication = "
                           "{ 'class':'SimpleStrategy', 'replication_factor':3};")))
+  (-> session (.execute (str
+                          "create table if not exists " test-keyspace ".iterations ("
+                          "  iteration uuid primary key,"
+                          "  attributes set<text>"
+                          ");")))
   (-> session (.execute (str
                           "create table if not exists " test-keyspace ".attributes ("
                           "  iteration uuid,"
@@ -84,23 +89,40 @@
                           "  primary key (iteration, object_name, attribute, level, received)"
                           ");"))))
 
+(defn record-iteration
+  [session keyspace iteration attributes]
+  (let [statement (BoundStatement.
+                    (-> session
+                      (.prepare
+                        (str "insert into " keyspace ".iterations (iteration, attributes) values (?,?);"))))]
+    (-> session
+      (.execute
+        (-> statement
+          (.bind
+            (into-array Object
+              [iteration
+               (let [hs (java.util.HashSet.)]
+                 (doseq [attr attributes]
+                   (.add hs (str (:object-name attr) " " (:attribute attr))))
+                 hs)])))))))
+
 (defn -main
   [properties-file & iteration]
 
   (let [properties (yaml/parse-string (slurp properties-file))
-       
         node-address (or (-> properties :tester-contact-point) "localhost")]
     (if (cassandra-is-running? node-address)
       (let [cluster (-> (Cluster/builder) (.addContactPoint (-> properties :recorder-contact-point)) .build)
             test-keyspace (str (-> properties :test-name))
+            iteration (java.util.UUID/fromString (or iteration (str (java.util.UUID/randomUUID))))
+            attributes (-> properties :attributes)
             session (-> cluster .connect)]
 
         (maybe-create-test-schema session test-keyspace)
+        (record-iteration session test-keyspace iteration attributes)
 
         (let [host (first (clojure.string/split node-address #":"))
               finished (atom nil)
-              iteration (java.util.UUID/fromString (or iteration (str (java.util.UUID/randomUUID))))
-              attributes (-> properties :attributes)
               record-promises (doall
                                 (pmap
                                   #(future
