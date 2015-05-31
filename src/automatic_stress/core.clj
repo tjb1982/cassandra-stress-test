@@ -2,9 +2,7 @@
   (:require [clojure.java.shell :refer [sh]]
             [clojure.java.jmx :as jmx :refer [mbean-names with-connection]]
             [clj-yaml.core :as yaml]
-            [clojure.pprint :as pprint]
-            ;[clojure.core.async :as async :refer :all])
-            )
+            [clojure.pprint :as pprint])
   (:import (com.datastax.driver.core Cluster
                                      BoundStatement)
            (com.datastax.driver.core.exceptions NoHostAvailableException))
@@ -31,11 +29,11 @@
 
 (defn deserialize-value
   [value]
-  (let [bais (java.io.ByteArrayInputStream. value)
-        ois (java.io.ObjectInputStream. bais)]
+  (let [ois (java.io.ObjectInputStream.
+              (java.io.ByteArrayInputStream. value))]
     (-> ois .readObject)))
 
-(defn non-negative
+(defn assert-non-negative
   [value state assertion & _]
   (let [state (if (nil? (:non-negative state))
                 (assoc state :non-negative {:count 0})
@@ -44,21 +42,21 @@
       (assoc state :non-negative {:count (inc (-> state :non-negative :count))})
       state)))
 
-(defn directional
+(defn assert-directed
   [value state assertion & _]
-  (let [state (if (nil? (:directional state))
-                (assoc state :directional {:count 0 :prev nil})
+  (let [state (if (nil? (:directed state))
+                (assoc state :directed {:count 0 :prev nil})
                 state)
         op (if (= "asc" (first (val (first assertion)))) > <)]
     (assoc-in
-      (if (and (not (nil? (-> state :directional :prev)))
-               (op (-> state :directional :prev) value))
-        (update-in state [:directional :count] inc)
+      (if (and (not (nil? (-> state :directed :prev)))
+               (op (-> state :directed :prev) value))
+        (update-in state [:directed :count] inc)
         state)
-      [:directional :prev]
+      [:directed :prev]
       value)))
 
-(defn volatile
+(defn assert-volatile
   [value state assertion idx]
   (let [state (if (nil? (:volatile state))
                 (assoc state :volatile {:count 0, :prev nil})
@@ -81,10 +79,12 @@
                   (jmx/read (name (:object-name attribute)) (keyword (:attribute attribute))))
           assertion-data (reduce
                            (fn [state assertion]
-                             (if-let [fun (resolve (symbol (str "automatic-stress.core/" (name (ffirst assertion)))))]
+                             (if-let [fun (resolve (symbol (str "automatic-stress.core/assert-" (name (ffirst assertion)))))]
                                (fun value state assertion idx)
-                               state))
-                           state
+                               (do
+                                 (println "Couldn't find assertion function \"" (name (ffirst assertion)) ".\" Ignoring")
+                                 state)))
+                             state
                            (-> attribute :assertions))
           statement (BoundStatement. (-> session (.prepare (str
                                                              "insert into " recording-keyspace ".attributes ( "
@@ -104,7 +104,7 @@
            "bigint"
            (serialize-value value)
            (int 0)
-           (.getTime (java.util.Date.))])))))
+           (java.util.Date.)])))))
       (print ".") (flush)
       (Thread/sleep (or (:frequency attribute) frequency))
       (if (nil? @finished)
@@ -120,7 +120,8 @@
   (-> session (.execute (str
                           "create table if not exists " recording-keyspace ".iterations ("
                           "  iteration uuid primary key,"
-                          "  attributes set<text>"
+                          "  attributes set<text>,"
+                          "  run_date timestamp"
                           ");")))
   (-> session (.execute (str
                           "create table if not exists " recording-keyspace ".attributes ("
@@ -130,7 +131,7 @@
                           "  type text,"
                           "  value blob,"
                           "  level int," ;; in the case where you want to be able to zoom in and out
-                          "  received bigint," ;; i.e., timestamp
+                          "  received timestamp,"
                           "  primary key (iteration, object_name, attribute, level, received)"
                           ");"))))
 
@@ -141,24 +142,25 @@
                       (.prepare
                         (str "insert into " keyspace ".iterations ("
                              "  iteration,"
+                             "  run_date,"
                              "  attributes"
-                             ") values (?,?);"))))]
+                             ") values (?,?,?);"))))]
     (-> session
       (.execute
         (-> statement
           (.bind
             (into-array Object
               [iteration
+               (java.util.Date.)
                (let [hs (java.util.HashSet.)]
                  (doseq [attr attributes]
                    (.add hs (str (:object-name attr) " " (:attribute attr))))
                  hs)])))))))
 
-(defn -main
-  [properties-file & iteration]
+(defn run-test
+  [properties & [iteration]]
 
-  (let [properties (yaml/parse-string (slurp properties-file))
-        tester-address (or (-> properties :tester-contact-point) "localhost")]
+  (let [tester-address (or (-> properties :tester-contact-point) "localhost")]
     (if (cassandra-is-running? tester-address)
       (let [cluster (-> (Cluster/builder)
                       (.addContactPoint (-> properties :recorder-contact-point))
@@ -174,29 +176,49 @@
 
         (let [host (first (clojure.string/split tester-address #":"))
               finished (atom nil)
-              record-promises (doall
-                                (pmap
-                                  #(future
-                                     (record-attribute session
-                                                       recording-keyspace
-                                                       iteration
-                                                       host
-                                                       (-> properties :jmx-port)
-                                                       %
-                                                       (or (-> properties :frequency) 1000)
-                                                       finished))
-                                  attributes))
-              stress-promise (future (sh "ls"))] ;(apply sh (clojure.string/split (-> properties :test-invocation) #" ")))]
-          (Thread/sleep 1000)
+              exit-status (atom 0)
+              record-promises (doall (pmap
+                                #(future
+                                   (record-attribute session
+                                                     recording-keyspace
+                                                     iteration
+                                                     host
+                                                     (-> properties :jmx-port)
+                                                     %
+                                                     (or (-> properties :frequency) 1000)
+                                                     finished))
+                                attributes))
+              stress-promise (future (apply sh (clojure.string/split (-> properties :test-invocation) #" ")))] ;(future (sh "ls"))]
+
           (swap! finished (fn [_] @stress-promise))
           (println "\n" (:out @finished))
+
           (doseq [p record-promises] (pprint/pprint @p))
+
+          (doseq [p record-promises] 
+            (doseq [result (-> @p :assertion-data)]
+              (when (> (-> result val :count) 0)
+                (swap! exit-status inc)
+                (println
+                  (format "Assertion failure: %s found %d times for attribute %s %s."
+                    (-> result key name)
+                    (-> result val :count)
+                    (-> @p :attribute :object-name)
+                    (-> @p :attribute :attribute))))))
+
           (println "UUID for this iteration: " iteration)
+
           (-> session .close)
           (-> cluster .close)
-          ;(assertion-checks)
-          ))
-      (println "Cassandra couldn't be found. Test aborted.")))
 
-  (shutdown-agents))
+          (shutdown-agents)
+          @exit-status
+          ))
+      (println "Cassandra couldn't be found. Test aborted."))))
+
+(defn -main
+  [properties-file & [iteration]]
+  (let [properties (yaml/parse-string (slurp properties-file))]
+    (run-test properties iteration)))
+
 

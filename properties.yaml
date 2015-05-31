@@ -2,15 +2,16 @@ tester-contact-point: localhost
 recorder-contact-point: localhost
 jmx-port: 7199
 recording-keyspace: test2
-frequency: 100
+frequency: 1
 
 test-invocation: /home/tjb1982/nclk/them/datastax/apache-cassandra-2.0.15/tools/bin/cassandra-stress
+#test-invocation: ls -la
 
 attributes:
   - object-name: org.apache.cassandra.metrics:type=ColumnFamily,name=LiveSSTableCount
     attribute: Value
     assertions:
-      - directional:
+      - directed:
         - asc
       - non-negative:
         - true
@@ -21,7 +22,7 @@ attributes:
     assertions:
       - non-negative:
         - true
-      - directional:
+      - directed:
         - asc
       - volatile:
         - 10
@@ -32,5 +33,5 @@ attributes:
       - non-negative:
         - true
       - volatile:
-        - 30
+        - 10
 
