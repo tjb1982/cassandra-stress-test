@@ -211,14 +211,13 @@
           (-> session .close)
           (-> cluster .close)
 
-          (shutdown-agents)
-          @exit-status
-          ))
+          @exit-status))
       (println "Cassandra couldn't be found. Test aborted."))))
 
 (defn -main
   [properties-file & [iteration]]
   (let [properties (yaml/parse-string (slurp properties-file))]
-    (run-test properties iteration)))
+    (run-test properties iteration)
+    (shutdown-agents)))
 
 
